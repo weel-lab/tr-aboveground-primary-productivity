@@ -1,0 +1,399 @@
+---
+title: "Tres Rios AGPP Data Processing"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document: default
+---
+
+This script is used to process Tres Rios aboveground primary productivity field data. This includes the following key functions: 
+1)summing plant-specific biomass calculations
+2)generating a QA report for biomass calculations which can be used to ID issues in raw plant data
+3)calculating relative abundance
+4)aggregating biomass by area and by month.
+
+
+```{r HOUSKEEPING}
+
+#libraries ----
+library('plyr') # always load plyr before dplyr
+library("dplyr")
+library("tidyr")
+library("stringr")
+library("lubridate")
+
+#import and clean agpp data
+agpp_data <- read.csv('/Users/chrissanchez/Documents/weel/tres rios/datasets/tr-aboveground-primary-productivity/data/tr_agpp_data.csv', stringsAsFactors = FALSE)
+agpp_data[agpp_data == ''] <- NA # change all missing values to NA
+agpp_data <- agpp_data %>%
+  filter(transect != "") %>% # remove all the empty rows 
+  select(-leaf_22) #deletes the leaf_22 column
+agpp_data[5:30] <- sapply(agpp_data[5:30], function(x) as.numeric(as.character(x))) #force all values columns to numeric format (from various)
+
+#import base spatial data and store in variables (site area, etc.)
+tr_totalarea = 210336.28/10 #not sure why this number is divided by 10 in the original quadrat total spreadsheets...perhaps to represent total marsh area represented by each transect?
+tr_totalarea_quads = tr_totalarea/5 #divides total area by 5 to approximate the amount of area represented by each transect
+tr_water_depth_m = 0.263
+tr_water_volume = 210336.28*tr_water_depth_m
+
+#converting various date and number formats
+agpp_data <- agpp_data %>%
+  mutate(date = mdy(date)) %>% #converts to date format using lubridate
+  mutate(plant_ID = as.integer(rownames(agpp_data))) %>% #adds an plant_ID (essentially observation #) for each plant
+  mutate(num_seed_stems = ifelse(num_seed_stems == 0, NA, num_seed_stems)) #converts values for num_seed_stesm to NA if 0
+
+#define a function leaf_max to calculate the maximum leaf size
+#we define our own function here to overcome challenges of using the existing apply and max fucntions - when a planet has no leaves all inputs to max are NA and the -Inf error occurs
+leaf_max <- function(x) ifelse(!all(is.na(x)), max(x, na.rm=TRUE), NA)
+
+```
+
+```{r BIOMASS MODELS}
+#define each biomass model as a function to be called downstream when biomass is being calculated
+#make edits to functions here and they will automatically be applied downstream
+#biomass models derived from '~/WEEL/Tres Rios/datasets/tr-aboveground-primary-productivity/models/plant biomass allometric models.xls'
+
+typha_model <- function(x) 
+  (0.093755*agpp_results$sum_leaf_lengths) + ((-7.022353)*agpp_results$num_leaves) + ((-0.301245)*agpp_results$longest_leaf) + 33.036984
+
+typha_seeds_model <- function(x)
+  (19.263017*agpp_results$cdb) + (0.3038842*agpp_results$stem_height) + (0.9302222*agpp_results$pistillate_length) + (17.475608*agpp_results$pistillate_width) - 98.18849
+
+sam_model <- function(x)
+  (3.5525089*agpp_results$cdb) + (0.0156807*agpp_results$stem_height) - 2.29794
+
+stab_sac_scal_model <- function(x)
+  (0.070105*agpp_results$stem_height) - 4.59057
+
+stab_sac_seeds_model <- function(x)
+  (0.0385071*agpp_results$stem_height) + (0.322009*agpp_results$stem_volume)
+
+scal_seeds_model <- function(x)
+  (0.244936*agpp_results$stem_height) + (0.057674*agpp_results$stem_volume)
+
+smar_model <- function(x)
+  (2.2194433*agpp_results$cdb) + (0.290014*agpp_results$stem_height) + (0.826226*agpp_results$num_seed_stems) - 1.947697
+
+```
+
+```{r BIOMASS CALCULATIONS}
+#this chunk calculates some summary variables and then outputs a dataframe with individual plant biomass values
+
+#calculate summary variables from raw plant data
+agpp_results <- agpp_data %>%
+  mutate(sum_leaf_lengths = rowSums(agpp_data[,8:29], na.rm = TRUE)) %>%
+  mutate(num_leaves = apply(agpp_data[8:29], 1, function(x) length(unique(x)))) %>%
+  mutate(longest_leaf = apply(agpp_data[8:29], 1, function(x) leaf_max(x))) %>%
+  mutate(stem_area = 3.14159*((cdb/2)^2)) %>% #cm2
+  mutate(stem_volume = ((1/3)*(3.14159)*((cdb/2)^2)*stem_height)) #cm3
+
+#calculate biomass for individual plants
+#uses a series of ifelse statements that specify which biomass function to call for a given set of plant conditions (species = ___ and seed/stem/pistillate prescence)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_americanus", sam_model(), NA)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_californicus" & agpp_results$num_seed_stems > 0, scal_seeds_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_californicus" & is.na(agpp_results$num_seed_stems) == TRUE, stab_sac_scal_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_acutus" & is.na(agpp_results$num_seed_stems) == TRUE, stab_sac_scal_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_tabernaemontani" & is.na(agpp_results$num_seed_stems) == TRUE, stab_sac_scal_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_maritimus", smar_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_acutus" & is.na(agpp_results$num_seed_stems) == FALSE, stab_sac_seeds_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "s_tabernaemontani" & is.na(agpp_results$num_seed_stems) == FALSE, stab_sac_seeds_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "t_latifolia" | agpp_results$species == "t_domingensis" & agpp_results$stem_height > 0, typha_seeds_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "t_latifolia" & is.na(agpp_results$leaf_1) == FALSE, typha_model(), agpp_results$biomass)
+agpp_results$biomass <- ifelse(agpp_results$species == "t_domingensis" & is.na(agpp_results$leaf_1) == FALSE, typha_model(), agpp_results$biomass)
+
+#troubleshooting
+#produces a new data frame biomass_qa to identify any NA biomass values generated by the previous bit of code. can use this to dig deeper into potential QA issues in original plant data (missing or misplaced values, etc.)
+agpp_biomass_qa <- filter(agpp_results, is.na(biomass)) #create a filtered spreadsheet to ID any NA's in biomass
+
+#QA
+#remove NA or negative values from biomass calculations column for the sake of facilitating downstream calculations
+#this should not be relied on - NA issues in the QA sheet should be investigated and resolved
+agpp_results$biomass <- ifelse(is.na(agpp_results$biomass) == TRUE | agpp_results$biomass < 0, 0, agpp_results$biomass) #turns NA's in biomass to 0 for the purposes of downstream calculations
+
+#tidying up - removes all raw and summary data and leaves only metadata and plant biomass calculations
+agpp_results <- agpp_results %>%
+  select(date:species, biomass, stem_area, stem_volume) %>%
+  mutate(biomass = as.numeric(biomass)) #converts biomass to numeric
+
+
+
+
+```
+
+```{r BIOMASS SUMS}
+#this chunk scales plant biomass values in space to the quadrat level, and then to the whole-system level
+
+#group agpp_results calculations by date, transect, quadrat, species) and create a data frame to store biomass sums by quadrat
+agpp_results <- group_by(agpp_results, date, transect, quadrat, species)
+quadrat_totals_agpp <- summarize(agpp_results,
+                           total_measured = sum(biomass), #sums the total biomass actually measured
+                           quadrat_spp_total = total_measured*4) #multiply measured biomass by 4 (quadrat = 0.25 square meters), this puts units in gdw/m2
+agpp_results <- ungroup(agpp_results) #remove groupings that were previously applied to this data frame
+
+#spreading quadrat sums out by species
+#we want the data arranged so that biomass for each species is aggregated only according to quadrat. as of previous step, species is still a sorting variable
+#this also forces the data frame to display results for all species for all quadrats (even if there is no measured biomass for a species)
+#from here on out biomass measurements represent values in gdw/m2 (total actually measured in the field * 4)
+quadrat_totals_agpp <- quadrat_totals_agpp %>%
+  spread(species, quadrat_spp_total) %>%
+  group_by(date, transect, quadrat) %>%
+  mutate(total_measured = NULL) #deletes total_measured - no longer necessary
+quadrat_totals_agpp[, 4:10][is.na(quadrat_totals_agpp[, 4:10])] <- 0 #replaces all NA values with 0
+quadrat_totals_agpp <- quadrat_totals_agpp %>%
+  summarize(
+    s_acutus = sum(s_acutus),
+    s_americanus = sum(s_americanus),
+    s_tabernaemontani = sum(s_tabernaemontani),
+    s_californicus = sum(s_californicus),
+    s_maritimus = sum(s_maritimus),
+    t_latifolia = sum(t_latifolia),
+    t_domingensis = sum(t_domingensis)) %>%
+  ungroup() %>%
+  mutate(
+    total_measured = (s_acutus + s_americanus + s_tabernaemontani + s_californicus + s_maritimus + t_latifolia + t_domingensis), #calculate all biomass for a given quadrat 
+    total_biomass = (total_measured*tr_totalarea_quads)/1000) #scale measured biomass to the amount of area represented by each quadrat, and use /1000 to convert g to kg
+```
+
+```{r STEM AREA SUMS}
+#this chunk scales plant steam area values in space to the quadrat level, and then to the whole-system level
+
+#group agpp_results calculations by date, transect, quadrat, species) and create a data frame to store biomass sums by quadrat
+agpp_results <- group_by(agpp_results, date, transect, quadrat, species)
+quadrat_totals_stemarea <- summarize(agpp_results,
+                           total_area_measured = sum(stem_area), #sums the total stem_volume actually measured
+                           quadrat_spp_total = total_area_measured*4) #multiply measured biomass by 4 (quadrat = 0.25 square meters), this puts units in cm2/m2
+agpp_results <- ungroup(agpp_results) #remove groupings that were previously applied to this data frame
+
+#spreading quadrat sums out by species
+#we want the data arranged so that data for each species is aggregated only according to quadrat. as of previous step, species is still a sorting variable
+#this also forces the data frame to display results for all species for all quadrats (even if there is no measured data for a species)
+#from here on out measurements represent values in cm2/m2 (total actually measured in the field * 4)
+quadrat_totals_stemarea <- quadrat_totals_stemarea %>%
+  spread(species, quadrat_spp_total) %>%
+  group_by(date, transect, quadrat) %>%
+  mutate(total_area_measured = NULL) #deletes total_volume_measured - no longer necessary
+quadrat_totals_stemarea[, 4:10][is.na(quadrat_totals_stemarea[, 4:10])] <- 0 #replaces all NA values with 0
+quadrat_totals_stemarea <- quadrat_totals_stemarea %>%
+  summarize(
+    s_acutus = sum(s_acutus),
+    s_americanus = sum(s_americanus),
+    s_tabernaemontani = sum(s_tabernaemontani),
+    s_californicus = sum(s_californicus),
+    s_maritimus = sum(s_maritimus),
+    t_latifolia = sum(t_latifolia),
+    t_domingensis = sum(t_domingensis)) %>%
+  ungroup() %>%
+  mutate(
+    total_area_measured = (s_acutus + s_americanus + s_tabernaemontani + s_californicus + s_maritimus + t_latifolia + t_domingensis), #calculate all stem volume for a given quadrat 
+    total_stem_area_cm2 = (total_area_measured*tr_totalarea_quads)) #scale measured stem areas to the amount of area represented by each quadrat
+```
+
+```{r RELATIVE ABUNDANCE}
+#this chunk calculates relative abundance at the quadrat level
+
+#create a variable to calculate and store relative abundance by quadrat
+relative_abundance <- quadrat_totals_agpp %>%
+  mutate(s_acutus = s_acutus/total_measured, #divide each spp biomass by the total for that quadrat, then replace the original biomass values with relative abundance
+         s_americanus = s_americanus/total_measured,
+         s_tabernaemontani = s_tabernaemontani/total_measured,
+         s_californicus = s_californicus/total_measured,
+         s_maritimus = s_maritimus/total_measured,
+         t_latifolia = t_latifolia/total_measured,
+         t_domingensis = t_domingensis/total_measured)
+relative_abundance[, 4:10][is.na(relative_abundance[, 4:10])] <- 0 #replaces all NaN values with 0 - using is.na because is.nan does not run on data frames
+
+#create a variable to calculate and store average relative abundance by month
+monthly_relative_abundance <- relative_abundance %>%
+  mutate(month = month(date)) %>%
+  mutate(year = year(date)) %>%
+  group_by(month, year) %>%
+  summarize(
+    s_acutus = mean(s_acutus),
+    s_americanus = mean(s_americanus),
+    s_tabernaemontani = mean(s_tabernaemontani),
+    s_californicus = mean(s_californicus),
+    s_maritimus = mean(s_maritimus),
+    t_latifolia = mean(t_latifolia),
+    t_domingensis = mean(t_domingensis)) %>%
+  arrange(year, month)
+```
+
+```{r MONTHLY TOTALS}
+
+#create monthly total agpp variable
+monthly_agpp_totals <- quadrat_totals_agpp %>% #create monthly total spreadsheet and extract columns of interest, then arrange by ascending year order
+  mutate(month = month(date)) %>%
+  mutate(year = year(date)) %>%
+  select(date, month, year, total_biomass) %>% #selects only the columns we are interested in
+  group_by(month, year) %>%
+  summarize(
+    monthly_biomass = sum(total_biomass))
+
+#create monthly total stem data data frame (area + calculate volume)
+monthly_stemarea_totals <- quadrat_totals_stemarea %>% #create monthly total spreadsheet and extract columns of interest, then arrange by ascending year order
+  mutate(month = month(date)) %>%
+  mutate(year = year(date)) %>%
+  select(date, month, year, total_stem_area_cm2) %>% #selects only the columns we are interested in
+  group_by(month, year) %>%
+  summarize(
+    monthly_stem_area_cm2 = sum(total_stem_area_cm2)) %>%
+  mutate(
+    monthly_stem_area_m2 = monthly_stem_area_cm2/10000, # /10000 to convert cm2 to m2
+    monthly_underwater_stem_volume_m3 = monthly_stem_area_m2*tr_water_depth_m
+  )
+
+#multiply stem areas by water depth (~25cm average) to get total water volume displaced, then divide by 1000000 to get cm3 to m3
+  
+#arrange monthly totals by year and month, ascending  
+monthly_agpp_totals <- arrange(monthly_agpp_totals, year, month) 
+monthly_stemarea_totals <- arrange(monthly_stemarea_totals, year, month) 
+
+#add in new formatted date colummn to make life easier when graphing downstream
+monthly_agpp_totals <- monthly_agpp_totals %>%
+  mutate(date = paste("01", month, year, sep = "/")) %>%
+  mutate(date = dmy(date))
+
+#ungroup data
+monthly_agpp_totals <- ungroup(monthly_agpp_totals)
+
+#bring in monthly relative abundance to monthly totals
+monthly_agpp_totals$s_acutus <- monthly_relative_abundance$s_acutus
+monthly_agpp_totals$s_americanus <- monthly_relative_abundance$s_americanus 
+monthly_agpp_totals$s_tabernaemontani <- monthly_relative_abundance$s_tabernaemontani 
+monthly_agpp_totals$s_californicus <- monthly_relative_abundance$s_californicus
+monthly_agpp_totals$s_maritimus <- monthly_relative_abundance$s_maritimus
+monthly_agpp_totals$t_latifolia <- monthly_relative_abundance$t_latifolia
+monthly_agpp_totals$t_domingensis <- monthly_relative_abundance$t_domingensis
+
+#calculate monthly total biomass by spp using relative abundance
+monthly_agpp_totals <- monthly_agpp_totals %>%
+  mutate(
+    s_acutus = s_acutus*monthly_biomass,
+    s_americanus = s_americanus*monthly_biomass,
+    s_tabernaemontani = s_tabernaemontani*monthly_biomass,
+    s_californicus = s_californicus*monthly_biomass,
+    s_maritimus = s_maritimus*monthly_biomass,
+    t_latifolia = t_latifolia*monthly_biomass,
+    t_domingensis = t_domingensis*monthly_biomass,
+    typha_spp = t_latifolia + t_domingensis,
+    sac_stab = s_acutus + s_tabernaemontani
+    )
+
+#create a data.frame with monthly totals in metric tons (10^3 kg)
+monthly_agpp_totals_MT <- monthly_agpp_totals %>%
+  mutate(
+    monthly_biomass = monthly_biomass/1000,
+    s_acutus = s_acutus/1000,
+    s_americanus = s_americanus/1000,
+    s_tabernaemontani = s_tabernaemontani/1000,
+    s_californicus = s_californicus/1000,
+    s_maritimus = s_maritimus/1000,
+    t_latifolia = t_latifolia/1000,
+    t_domingensis = t_domingensis/1000,
+    typha_spp = typha_spp/1000,
+    sac_stab = sac_stab/1000
+    )
+
+```
+
+
+```{r}
+#PRINTING TO CSV
+#write certain datasheets as csv to results directory
+
+#biomass
+write.csv(monthly_agpp_totals, file = "/Users/chrissanchez/Documents/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_agpp_monthly_totals.csv")
+write.csv(monthly_agpp_totals_MT, file = "/Users/chrissanchez/Documents/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_agpp_monthly_totals_MT.csv")
+write.csv(quadrat_totals_agpp, file = "/Users/chrissanchez/Documents/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_agpp_quadrat_totals.csv")
+write.csv(monthly_relative_abundance, file = "/Users/chrissanchez/Documents/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_monthly_relative_abundance.csv")
+
+#stem area and volume
+write.csv(monthly_stemarea_totals, file = "/Volumes/GoogleDrive/My Drive/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_stemdata_monthly_totals.csv")
+
+```
+
+```{r}
+#QA
+
+#create and write write file to output all unique values for all columns for QA review
+
+tr_agpp_metadataQA <- lapply(agpp_data, unique)
+write.csv(tr_agpp_metadataQA, file = "/Volumes/GoogleDrive/My Drive/weel/tres rios/datasets/tr-aboveground-primary-productivity/data/tr_metadataQA")
+
+```
+
+
+```{r}
+#BIOMASS RATES - may just need to continue doing this in excel for now until I figure out how to do this step in R
+
+#create a new data frame that calculates the differences between each consecutive month (row) in monthly_totals for each plant species
+biomass_rates <- data.frame(
+  typha_diff = abs(diff(monthly_totals$typha_spp)), 
+  sac_stab_diff = abs(diff(monthly_totals$sac_stab)),
+  s_americanus_diff = abs(diff(monthly_totals$s_americanus)),
+  s_californicus_diff = abs(diff(monthly_totals$s_californicus)),
+  s_maritimus_diff = abs(diff(monthly_totals$s_maritimus)))
+
+#introduce a formula to calculate moving averages
+mav <- function(x,n=5){filter(x,rep(1/n,n), sides=2)}
+
+  #LEFT OFF HERE - one trick may be using the "lags" function in dplyr to do something?
+  # moving averages may also be key to getting the biomass rates to calculate correctly
+  # finding a way to autopopulate dates (may need to write custom function) could also help tremendously
+  
+```
+
+
+*To Do List*
+1) Verify that NA coercion is not creating issues downstream (missing values, etc.).
+
+2) Investigate how to automate QAQC.
+
+3) Re-arrange columns in monthly_totals to put formatted date column first
+
+4) ~~Relative abundance is calculating incorectly - not summing to 100~~ *FIXED 8/5/2017*
+
+5) make sure that field data columns primary productivty data sheet is formatted as numeric in order to write script to calculate plant characteristics
+6) write scripts to calculate plant characteristics
+6)manually calculate biomass using allometric models
+6) investigate QA with regards to thatched quadrates and NAs
+
+20181211
+added stuff to calculate stem volumes, need to do the same for stem areas
+2) is the "quadrat" label misleading? since values in those spreadsheets are not actually #'s measured, but, multipled by 4 to put it in terms of area?
+
+EXTRA CODE BITS
+#below is code scrapped from an attempt to reorgnize how plant data is structured - may be useful later
+primary_productivity[,8:29] <- sapply(primary_productivity[,8:29], function(x) as.numeric(as.character(x)))
+primary_names <- colnames(primary_productivity)
+primary_names <-sub("leaf_", "leaf__", primary_names)
+colnames(primary_productivity) <- primary_names
+
+
+#new approach to primary productivity - link everything to plant_ID 
+primary_productivity_new <- primary_productivity %>%
+  mutate(plant_ID = as.integer(rownames(primary_productivity))) %>%
+  select(1:31, data.book.ID, Notes, plant_ID) %>%
+  gather(characteristic, value, cdb:pistillate_width, na.rm = TRUE, convert = TRUE) %>%
+  mutate(date = ymd(date)) %>%
+  na.omit(primary_productivity_new$value) %>% #remove any NA's from value column to allow us to 
+  mutate(value = as.numeric(value)) %>%
+  separate(characteristic, into = c("characteristic", "characteristic_type"), sep = "__", fill = "right", convert = TRUE)  %>%
+  arrange(plant_ID)
+
+primary_productivity_results <- primary_productivity_new %>%
+  group_by(date, transect, quadrat, species, plant_ID, characteristic) %>%
+  summarize(
+    value = sum(value)
+  )
+
+#old nested ifelse statement
+
+agpp_results$biomass <-  ifelse(agpp_results$species == "s_americanus", sam_model(), 
+                         ifelse(agpp_results$species == "s_californicus" & agpp_results$num_seed_stems > 0, scal_seeds_model(), 
+                         ifelse(agpp_results$species == "s_acutus" | agpp_results$species == "s_californicus" | agpp_results$species == "s_tabernaemontani" & is.na(agpp_results$num_seed_stems) == TRUE,           stab_sac_scal_model(),
+                         ifelse(agpp_results$species == "s_maritimus", smar_model(),
+                         ifelse(agpp_results$species == "s_acutus" | agpp_results$species == "s_tabernaemontani" & agpp_results$num_seed_stems > 0, stab_sac_seeds_model(),
+                         ifelse(agpp_results$species == "t_latifolia" | agpp_results$species == "t_domingensis" & agpp_results$pistillate_length > 0, typha_seeds_model(),
+                         ifelse(agpp_results$species == "t_latifolia" | agpp_results$species == "t_domingensis", typha_model(), "leftovers")
+                         ))))))
