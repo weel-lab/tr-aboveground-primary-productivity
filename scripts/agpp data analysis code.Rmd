@@ -308,7 +308,7 @@ write.csv(quadrat_totals_agpp, file = "/Users/chrissanchez/Documents/weel/tres r
 write.csv(monthly_relative_abundance, file = "/Users/chrissanchez/Documents/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_monthly_relative_abundance.csv")
 
 #stem area and volume
-write.csv(monthly_stemarea_totals, file = "/Volumes/GoogleDrive/My Drive/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_stemdata_monthly_totals.csv")
+write.csv(monthly_stemarea_totals, file = "/Users/chrissanchez/Documents/weel/tres rios/datasets/tr-aboveground-primary-productivity/results/tr_stemdata_monthly_totals.csv")
 
 ```
 
